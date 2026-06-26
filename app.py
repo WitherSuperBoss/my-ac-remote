@@ -29,6 +29,7 @@ HTML_PAGE = """
         .temp-btn { background-color: #2196F3; color: white; font-size: 28px; width: 60px; height: 60px; border-radius: 50%; padding: 0;}
         .mode-btn { background-color: #444; color: white; width: 42%; font-size: 16px;}
         .send-temp-btn { background-color: #FF9800; color: white; width: 88%; margin-top: 15px; padding: 20px;}
+        .wind-btn { background-color: #607D8B; color: white; width: 42%; font-size: 16px; margin-top: 5px;}
         .temp-display { font-size: 48px; margin: 0 20px; font-weight: bold; vertical-align: middle;}
         .section { margin: 15px auto; padding: 20px 10px; background: #2c2c2c; border-radius: 20px; width: 90%; max-width: 400px;}
         .section-title { font-size: 14px; color: #aaa; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 1px;}
@@ -63,6 +64,14 @@ HTML_PAGE = """
         <button class="btn mode-btn" onclick="send('mode', 2)">🤖 Авто-режим</button>
     </div>
 
+    <div class="section">
+        <div class="section-title">Скорость обдува</div>
+        <button class="btn wind-btn" onclick="send('wind', 0)">🤖 Авто</button>
+        <button class="btn wind-btn" onclick="send('wind', 1)">🔽 Минимум</button>
+        <button class="btn wind-btn" onclick="send('wind', 2)">▶️ Средняя</button>
+        <button class="btn wind-btn" onclick="send('wind', 3)">🔼 Максимум</button>
+    </div>
+
     <script>
         let currentTemp = 22;
         function changeTemp(delta) {
@@ -79,14 +88,19 @@ HTML_PAGE = """
 
         function send(code, value) {
             let statusDiv = document.getElementById('status');
-            statusDiv.innerText = "⏳ Отправка в Tuya...";
+            statusDiv.innerText = "⏳ Отправка...";
             statusDiv.style.color = "#ffeb3b";
             
             fetch(`/api/command?code=${code}&value=${value}`)
                 .then(response => response.json())
                 .then(data => {
-                    statusDiv.innerText = "✅ " + data.message;
-                    statusDiv.style.color = "#4CAF50";
+                    if(data.status === "success") {
+                        statusDiv.innerText = "✅ Сигнал отправлен!";
+                        statusDiv.style.color = "#4CAF50";
+                    } else {
+                        statusDiv.innerText = "❌ Ошибка Tuya";
+                        statusDiv.style.color = "#f44336";
+                    }
                 })
                 .catch(error => {
                     statusDiv.innerText = "❌ Ошибка сети";
@@ -111,7 +125,6 @@ def command():
         value = int(value)
         
     try:
-        # Для облака: подключаемся к Tuya прямо в момент нажатия (токен всегда свежий)
         cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
         cmd = {"code": code, "value": value}
         cloud.cloudrequest(URL_IR, post=cmd)
@@ -119,7 +132,6 @@ def command():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
 
-# Главный запуск для Render.com
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
