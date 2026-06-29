@@ -33,12 +33,12 @@ HTML_PAGE = """
         .temp-display { font-size: 48px; margin: 0 20px; font-weight: bold; vertical-align: middle;}
         .section { margin: 15px auto; padding: 20px 10px; background: #2c2c2c; border-radius: 20px; width: 90%; max-width: 400px;}
         .section-title { font-size: 14px; color: #aaa; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 1px;}
-        #status { margin-top: 10px; font-size: 16px; color: #aaa; background: #2c2c2c; padding: 10px; border-radius: 10px; display: inline-block; width: 85%; max-width: 380px;}
+        #status { margin-top: 10px; font-size: 16px; color: #white; background: #444; padding: 12px; border-radius: 12px; display: inline-block; width: 85%; max-width: 380px; font-weight: bold; transition: 0.3s;}
     </style>
 </head>
 <body>
     <h2 style="margin-bottom: 5px;">Кондиционер</h2>
-    <div id="status">✅ Облако готово</div>
+    <div id="status">🔍 Проверка связи...</div>
 
     <div class="section">
         <div class="section-title">Питание</div>
@@ -74,6 +74,8 @@ HTML_PAGE = """
 
     <script>
         let currentTemp = 22;
+        let isSending = false;
+
         function changeTemp(delta) {
             currentTemp += delta;
             if(currentTemp < 16) currentTemp = 30; 
@@ -86,27 +88,51 @@ HTML_PAGE = """
             send('temp', currentTemp);
         }
 
+        function checkStatus() {
+            if (isSending) return; // Не перебиваем статус во время отправки команды
+            fetch('/api/status')
+                .then(response => response.json())
+                .then(data => {
+                    let statusDiv = document.getElementById('status');
+                    if(data.online) {
+                        statusDiv.innerText = "🟢 Пульт активен";
+                        statusDiv.style.background = "#2e7d32";
+                    } else {
+                        statusDiv.innerText = "🔴 Пульт не активен";
+                        statusDiv.style.background = "#c62828";
+                    }
+                })
+                .catch(() => {});
+        }
+
         function send(code, value) {
+            isSending = true;
             let statusDiv = document.getElementById('status');
-            statusDiv.innerText = "⏳ Отправка...";
-            statusDiv.style.color = "#ffeb3b";
+            statusDiv.innerText = "⏳ Отправка команды...";
+            statusDiv.style.background = "#ff9800";
             
             fetch(`/api/command?code=${code}&value=${value}`)
                 .then(response => response.json())
                 .then(data => {
                     if(data.status === "success") {
-                        statusDiv.innerText = "✅ Сигнал отправлен!";
-                        statusDiv.style.color = "#4CAF50";
+                        statusDiv.innerText = "✅ " + data.message;
+                        statusDiv.style.background = "#4CAF50";
                     } else {
                         statusDiv.innerText = "❌ Ошибка Tuya";
-                        statusDiv.style.color = "#f44336";
+                        statusDiv.style.background = "#f44336";
                     }
+                    setTimeout(() => { isSending = false; checkStatus(); }, 3000);
                 })
                 .catch(error => {
                     statusDiv.innerText = "❌ Ошибка сети";
-                    statusDiv.style.color = "#f44336";
+                    statusDiv.style.background = "#f44336";
+                    setTimeout(() => { isSending = false; checkStatus(); }, 3000);
                 });
         }
+
+        // Проверяем статус каждые 12 секунд и при загрузке страницы
+        window.onload = checkStatus;
+        setInterval(checkStatus, 12000);
     </script>
 </body>
 </html>
@@ -115,6 +141,18 @@ HTML_PAGE = """
 @app.route('/')
 def index():
     return render_template_string(HTML_PAGE)
+
+@app.route('/api/status')
+def status():
+    try:
+        cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
+        res = cloud.cloudrequest(f"/v1.0/devices/{IR_HUB_ID}")
+        if res and res.get('success'):
+            is_online = res.get('result', {}).get('online', False)
+            return jsonify({"status": "success", "online": is_online})
+        return jsonify({"status": "error", "online": False})
+    except:
+        return jsonify({"status": "error", "online": False})
 
 @app.route('/api/command')
 def command():
@@ -126,9 +164,21 @@ def command():
         
     try:
         cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
-        cmd = {"code": code, "value": value}
-        cloud.cloudrequest(URL_IR, post=cmd)
-        return jsonify({"status": "success", "message": "Сигнал отправлен!"})
+        
+        # ЕСЛИ НАЖАЛИ ВКЛЮЧИТЬ (power: 1)
+        if code == 'power' and value == 1:
+            # 1. Стреляем командой включения
+            cloud.cloudrequest(URL_IR, post={"code": "power", "value": 1})
+            # 2. Сразу же стреляем командой максимального обдува (3)
+            cloud.cloudrequest(URL_IR, post={"code": "wind", "value": 3})
+            return jsonify({"status": "success", "message": "Включен на макс. скорость!"})
+            
+        else:
+            # Обычные одиночные команды (выключение, температура, режимы)
+            cmd = {"code": code, "value": value}
+            cloud.cloudrequest(URL_IR, post=cmd)
+            return jsonify({"status": "success", "message": "Сигнал отправлен!"})
+            
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
 
