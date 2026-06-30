@@ -2,6 +2,8 @@ import flask
 from flask import request, jsonify, render_template_string
 import tinytuya
 import os
+import threading
+import time
 
 # === ТВОИ КЛЮЧИ ===
 IR_HUB_ID = "bf21110124fae7e2efs8na"
@@ -13,6 +15,35 @@ API_REGION = "eu"
 app = flask.Flask(__name__)
 
 URL_IR = f"/v1.0/infrareds/{IR_HUB_ID}/air-conditioners/{AC_DEVICE_ID}/command"
+
+# Список активных таймеров
+timers = []
+
+# Фоновый рабочий, который следит за временем
+def timer_worker():
+    global timers
+    while True:
+        now = time.time()
+        for t in timers[:]:
+            if now >= t['execute_at']:
+                try:
+                    cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
+                    if t['action'] == 'on':
+                        # Включаем и сразу ставим макс скорость
+                        cloud.cloudrequest(URL_IR, post={"code": "power", "value": 1})
+                        cloud.cloudrequest(URL_IR, post={"code": "wind", "value": 3})
+                    elif t['action'] == 'off':
+                        # Выключаем
+                        cloud.cloudrequest(URL_IR, post={"code": "power", "value": 0})
+                except Exception as e:
+                    print("Ошибка таймера:", e)
+                # Удаляем отработавший таймер
+                timers.remove(t)
+        time.sleep(10) # Проверяем каждые 10 секунд
+
+# Запускаем фоновый поток при старте сервера
+threading.Thread(target=timer_worker, daemon=True).start()
+
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -34,6 +65,13 @@ HTML_PAGE = """
         .section { margin: 15px auto; padding: 20px 10px; background: #2c2c2c; border-radius: 20px; width: 90%; max-width: 400px;}
         .section-title { font-size: 14px; color: #aaa; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 1px;}
         #status { margin-top: 10px; font-size: 16px; color: #white; background: #444; padding: 12px; border-radius: 12px; display: inline-block; width: 85%; max-width: 380px; font-weight: bold; transition: 0.3s;}
+        
+        /* Стили для ползунка */
+        input[type=range] { -webkit-appearance: none; width: 90%; margin: 15px 0; background: transparent; }
+        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; height: 24px; width: 24px; border-radius: 50%; background: #FF9800; cursor: pointer; margin-top: -8px; box-shadow: 0 0 10px rgba(255,152,0,0.5); }
+        input[type=range]::-webkit-slider-runnable-track { width: 100%; height: 8px; cursor: pointer; background: #444; border-radius: 4px; }
+        .timer-display { font-size: 24px; font-weight: bold; color: #FF9800; margin-bottom: 5px; }
+        #activeTimers { margin-top: 15px; font-size: 14px; color: #03a9f4; font-weight: bold; text-align: left; padding: 0 20px;}
     </style>
 </head>
 <body>
@@ -44,6 +82,17 @@ HTML_PAGE = """
         <div class="section-title">Питание</div>
         <button class="btn power-on" onclick="send('power', 1)">ВКЛЮЧИТЬ</button>
         <button class="btn power-off" onclick="send('power', 0)">ВЫКЛЮЧИТЬ</button>
+    </div>
+    
+    <div class="section" style="border: 2px dashed #444;">
+        <div class="section-title">Таймер</div>
+        <div class="timer-display" id="sliderValDisplay">30 мин</div>
+        <input type="range" id="timeSlider" min="10" max="720" step="10" value="30" oninput="updateSlider()">
+        <div>
+            <button class="btn power-on" style="width: 42%; font-size: 14px; background-color: #388E3C;" onclick="setTimer('on')">ВКЛ через...</button>
+            <button class="btn power-off" style="width: 42%; font-size: 14px; background-color: #d32f2f;" onclick="setTimer('off')">ВЫКЛ через...</button>
+        </div>
+        <div id="activeTimers"></div>
     </div>
 
     <div class="section">
@@ -76,6 +125,18 @@ HTML_PAGE = """
         let currentTemp = 22;
         let isSending = false;
 
+        function updateSlider() {
+            let val = document.getElementById('timeSlider').value;
+            let display = document.getElementById('sliderValDisplay');
+            if (val < 60) {
+                display.innerText = val + " мин";
+            } else {
+                let h = Math.floor(val / 60);
+                let m = val % 60;
+                display.innerText = h + " ч " + (m > 0 ? m + " мин" : "00 мин");
+            }
+        }
+
         function changeTemp(delta) {
             currentTemp += delta;
             if(currentTemp < 16) currentTemp = 30; 
@@ -84,12 +145,10 @@ HTML_PAGE = """
             document.getElementById('tempSend').innerText = currentTemp;
         }
 
-        function sendTemp() {
-            send('temp', currentTemp);
-        }
+        function sendTemp() { send('temp', currentTemp); }
 
         function checkStatus() {
-            if (isSending) return; // Не перебиваем статус во время отправки команды
+            if (isSending) return;
             fetch('/api/status')
                 .then(response => response.json())
                 .then(data => {
@@ -101,8 +160,32 @@ HTML_PAGE = """
                         statusDiv.innerText = "🔴 Пульт не активен";
                         statusDiv.style.background = "#c62828";
                     }
-                })
-                .catch(() => {});
+                    
+                    let timersDiv = document.getElementById('activeTimers');
+                    if(data.timers && data.timers.length > 0) {
+                        timersDiv.innerHTML = "⏳ <b>Ожидают выполнения:</b><br>" + data.timers.join('<br>');
+                    } else {
+                        timersDiv.innerHTML = "";
+                    }
+                }).catch(() => {});
+        }
+
+        function setTimer(action) {
+            let val = document.getElementById('timeSlider').value;
+            let actionText = action === 'on' ? 'ВКЛЮЧЕНИЕ' : 'ВЫКЛЮЧЕНИЕ';
+            
+            isSending = true;
+            let statusDiv = document.getElementById('status');
+            statusDiv.innerText = "⏳ Ставлю таймер...";
+            statusDiv.style.background = "#ff9800";
+
+            fetch(`/api/timer?action=${action}&minutes=${val}`)
+                .then(res => res.json())
+                .then(data => {
+                    statusDiv.innerText = `✅ ${actionText} через ${val} мин`;
+                    statusDiv.style.background = "#4CAF50";
+                    setTimeout(() => { isSending = false; checkStatus(); }, 2000);
+                });
         }
 
         function send(code, value) {
@@ -130,8 +213,7 @@ HTML_PAGE = """
                 });
         }
 
-        // Проверяем статус каждые 12 секунд и при загрузке страницы
-        window.onload = checkStatus;
+        window.onload = function() { checkStatus(); updateSlider(); };
         setInterval(checkStatus, 12000);
     </script>
 </body>
@@ -147,38 +229,52 @@ def status():
     try:
         cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
         res = cloud.cloudrequest(f"/v1.0/devices/{IR_HUB_ID}")
+        is_online = False
         if res and res.get('success'):
             is_online = res.get('result', {}).get('online', False)
-            return jsonify({"status": "success", "online": is_online})
-        return jsonify({"status": "error", "online": False})
+        
+        # Считаем, сколько минут осталось активным таймерам
+        active_timers = []
+        now = time.time()
+        for t in timers:
+            rem = int((t['execute_at'] - now) / 60)
+            if rem >= 0:
+                action_ru = "ВКЛ" if t['action'] == 'on' else "ВЫКЛ"
+                active_timers.append(f"• {action_ru} через ~{rem} мин")
+                
+        return jsonify({"status": "success", "online": is_online, "timers": active_timers})
     except:
-        return jsonify({"status": "error", "online": False})
+        return jsonify({"status": "error", "online": False, "timers": []})
+
+@app.route('/api/timer')
+def set_timer():
+    global timers
+    action = request.args.get('action')
+    minutes = int(request.args.get('minutes', 0))
+    
+    # Удаляем старые таймеры на такое же действие (чтобы не было дублей)
+    timers = [t for t in timers if t['action'] != action]
+    
+    execute_at = time.time() + (minutes * 60)
+    timers.append({"action": action, "execute_at": execute_at})
+    
+    return jsonify({"status": "success"})
 
 @app.route('/api/command')
 def command():
     code = request.args.get('code')
     value = request.args.get('value', '')
-    
-    if value.isdigit():
-        value = int(value)
+    if value.isdigit(): value = int(value)
         
     try:
         cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
-        
-        # ЕСЛИ НАЖАЛИ ВКЛЮЧИТЬ (power: 1)
         if code == 'power' and value == 1:
-            # 1. Стреляем командой включения
             cloud.cloudrequest(URL_IR, post={"code": "power", "value": 1})
-            # 2. Сразу же стреляем командой максимального обдува (3)
             cloud.cloudrequest(URL_IR, post={"code": "wind", "value": 3})
             return jsonify({"status": "success", "message": "Включен на макс. скорость!"})
-            
         else:
-            # Обычные одиночные команды (выключение, температура, режимы)
-            cmd = {"code": code, "value": value}
-            cloud.cloudrequest(URL_IR, post=cmd)
+            cloud.cloudrequest(URL_IR, post={"code": code, "value": value})
             return jsonify({"status": "success", "message": "Сигнал отправлен!"})
-            
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
 
