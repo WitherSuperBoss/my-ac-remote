@@ -16,10 +16,8 @@ app = flask.Flask(__name__)
 
 URL_IR = f"/v1.0/infrareds/{IR_HUB_ID}/air-conditioners/{AC_DEVICE_ID}/command"
 
-# Список активных таймеров
 timers = []
 
-# Фоновый рабочий, который следит за временем
 def timer_worker():
     global timers
     while True:
@@ -29,21 +27,21 @@ def timer_worker():
                 try:
                     cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
                     if t['action'] == 'on':
-                        # Включаем и сразу ставим макс скорость
+                        # 1. Включаем
                         cloud.cloudrequest(URL_IR, post={"code": "power", "value": 1})
+                        # 2. Ждем полторы секунды, чтобы ИК-диод успел передать сигнал
+                        time.sleep(1.5)
+                        # 3. Ставим макс скорость
                         cloud.cloudrequest(URL_IR, post={"code": "wind", "value": 3})
                     elif t['action'] == 'off':
                         # Выключаем
                         cloud.cloudrequest(URL_IR, post={"code": "power", "value": 0})
                 except Exception as e:
                     print("Ошибка таймера:", e)
-                # Удаляем отработавший таймер
                 timers.remove(t)
-        time.sleep(10) # Проверяем каждые 10 секунд
+        time.sleep(10)
 
-# Запускаем фоновый поток при старте сервера
 threading.Thread(target=timer_worker, daemon=True).start()
-
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -66,7 +64,6 @@ HTML_PAGE = """
         .section-title { font-size: 14px; color: #aaa; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 1px;}
         #status { margin-top: 10px; font-size: 16px; color: #white; background: #444; padding: 12px; border-radius: 12px; display: inline-block; width: 85%; max-width: 380px; font-weight: bold; transition: 0.3s;}
         
-        /* Стили для ползунка */
         input[type=range] { -webkit-appearance: none; width: 90%; margin: 15px 0; background: transparent; }
         input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; height: 24px; width: 24px; border-radius: 50%; background: #FF9800; cursor: pointer; margin-top: -8px; box-shadow: 0 0 10px rgba(255,152,0,0.5); }
         input[type=range]::-webkit-slider-runnable-track { width: 100%; height: 8px; cursor: pointer; background: #444; border-radius: 4px; }
@@ -233,7 +230,6 @@ def status():
         if res and res.get('success'):
             is_online = res.get('result', {}).get('online', False)
         
-        # Считаем, сколько минут осталось активным таймерам
         active_timers = []
         now = time.time()
         for t in timers:
@@ -252,7 +248,6 @@ def set_timer():
     action = request.args.get('action')
     minutes = int(request.args.get('minutes', 0))
     
-    # Удаляем старые таймеры на такое же действие (чтобы не было дублей)
     timers = [t for t in timers if t['action'] != action]
     
     execute_at = time.time() + (minutes * 60)
@@ -268,13 +263,20 @@ def command():
         
     try:
         cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
+        
         if code == 'power' and value == 1:
+            # 1. Включаем
             cloud.cloudrequest(URL_IR, post={"code": "power", "value": 1})
+            # 2. Ждем полторы секунды
+            time.sleep(1.5)
+            # 3. Врубаем макс скорость
             cloud.cloudrequest(URL_IR, post={"code": "wind", "value": 3})
             return jsonify({"status": "success", "message": "Включен на макс. скорость!"})
+            
         else:
             cloud.cloudrequest(URL_IR, post={"code": code, "value": value})
             return jsonify({"status": "success", "message": "Сигнал отправлен!"})
+            
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
 
