@@ -16,32 +16,78 @@ app = flask.Flask(__name__)
 
 URL_IR = f"/v1.0/infrareds/{IR_HUB_ID}/air-conditioners/{AC_DEVICE_ID}/command"
 
+# Глобальные переменные для умной логики
 timers = []
+command_queue = [] # Очередь команд
+device_status = {"online": True, "offline_since": None} # Память о статусе
 
-def timer_worker():
-    global timers
+def check_tuya_status():
+    try:
+        cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
+        res = cloud.cloudrequest(f"/v1.0/devices/{IR_HUB_ID}")
+        if res and res.get('success'):
+            return res.get('result', {}).get('online', False)
+    except:
+        pass
+    return False
+
+# ГЛАВНЫЙ ФОНОВЫЙ ПРОЦЕСС (работает 24/7)
+def master_worker():
+    global timers, command_queue, device_status
     while True:
         now = time.time()
+        
+        # 1. Проверяем статус пульта
+        is_online = check_tuya_status()
+        if is_online:
+            device_status["online"] = True
+            device_status["offline_since"] = None
+        else:
+            if device_status["online"]: # Только что отключился
+                device_status["offline_since"] = now
+            device_status["online"] = False
+
+        # 2. Проверяем таймеры
         for t in timers[:]:
             if now >= t['execute_at']:
-                try:
-                    cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
-                    if t['action'] == 'on':
-                        # 1. Включаем
-                        cloud.cloudrequest(URL_IR, post={"code": "power", "value": 1})
-                        # 2. Ждем полторы секунды, чтобы ИК-диод успел передать сигнал
-                        time.sleep(1.5)
-                        # 3. Ставим макс скорость
-                        cloud.cloudrequest(URL_IR, post={"code": "wind", "value": 3})
-                    elif t['action'] == 'off':
-                        # Выключаем
-                        cloud.cloudrequest(URL_IR, post={"code": "power", "value": 0})
-                except Exception as e:
-                    print("Ошибка таймера:", e)
+                if t['action'] == 'on':
+                    # Добавляем в очередь ВКЛ и ВЕТЕР
+                    command_queue.append({"code": "power", "value": 1})
+                    command_queue.append({"code": "wind", "value": 3, "delay": 1.5})
+                elif t['action'] == 'off':
+                    command_queue.append({"code": "power", "value": 0})
                 timers.remove(t)
-        time.sleep(10)
 
-threading.Thread(target=timer_worker, daemon=True).start()
+        # 3. Разгребаем очередь команд (ТОЛЬКО ЕСЛИ ПУЛЬТ В СЕТИ)
+        if device_status["online"] and len(command_queue) > 0:
+            cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
+            
+            while len(command_queue) > 0:
+                cmd = command_queue[0] # Берем первую команду
+                
+                # Если нужна задержка перед выстрелом (например, для ветра)
+                if "delay" in cmd:
+                    time.sleep(cmd["delay"])
+                    
+                try:
+                    res = cloud.cloudrequest(URL_IR, post={"code": cmd["code"], "value": cmd["value"]})
+                    # Если Tuya ругается на оффлайн
+                    if res and not res.get('success') and 'offline' in str(res).lower():
+                        device_status["online"] = False
+                        if not device_status["offline_since"]: device_status["offline_since"] = now
+                        break # Прерываем отправку, оставляем в очереди
+                    
+                    # Успешно отправлено! Удаляем из очереди
+                    command_queue.pop(0)
+                    time.sleep(0.5) # Микро-пауза между выстрелами
+                except Exception as e:
+                    print("Ошибка отправки:", e)
+                    break # Останавливаемся до следующего цикла
+
+        time.sleep(8) # Рабочий проверяет всё каждые 8 секунд
+
+# Запускаем рабочего
+threading.Thread(target=master_worker, daemon=True).start()
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -120,7 +166,6 @@ HTML_PAGE = """
 
     <script>
         let currentTemp = 22;
-        let isSending = false;
 
         function updateSlider() {
             let val = document.getElementById('timeSlider').value;
@@ -145,19 +190,30 @@ HTML_PAGE = """
         function sendTemp() { send('temp', currentTemp); }
 
         function checkStatus() {
-            if (isSending) return;
             fetch('/api/status')
                 .then(response => response.json())
                 .then(data => {
                     let statusDiv = document.getElementById('status');
+                    
+                    // Формируем текст статуса
+                    let text = "";
                     if(data.online) {
-                        statusDiv.innerText = "🟢 Пульт активен";
+                        text = "🟢 Пульт активен";
                         statusDiv.style.background = "#2e7d32";
                     } else {
-                        statusDiv.innerText = "🔴 Пульт не активен";
+                        text = "🔴 Не активен (" + data.offline_time + ")";
                         statusDiv.style.background = "#c62828";
                     }
                     
+                    // Если есть очередь команд
+                    if(data.queue_len > 0) {
+                        text += ` ⏳ (Ждут: ${data.queue_len})`;
+                        if(data.online) statusDiv.style.background = "#ff9800"; // Оранжевый, если отправляет
+                    }
+                    
+                    statusDiv.innerText = text;
+                    
+                    // Обновляем таймеры
                     let timersDiv = document.getElementById('activeTimers');
                     if(data.timers && data.timers.length > 0) {
                         timersDiv.innerHTML = "⏳ <b>Ожидают выполнения:</b><br>" + data.timers.join('<br>');
@@ -169,49 +225,19 @@ HTML_PAGE = """
 
         function setTimer(action) {
             let val = document.getElementById('timeSlider').value;
-            let actionText = action === 'on' ? 'ВКЛЮЧЕНИЕ' : 'ВЫКЛЮЧЕНИЕ';
-            
-            isSending = true;
-            let statusDiv = document.getElementById('status');
-            statusDiv.innerText = "⏳ Ставлю таймер...";
-            statusDiv.style.background = "#ff9800";
-
             fetch(`/api/timer?action=${action}&minutes=${val}`)
                 .then(res => res.json())
-                .then(data => {
-                    statusDiv.innerText = `✅ ${actionText} через ${val} мин`;
-                    statusDiv.style.background = "#4CAF50";
-                    setTimeout(() => { isSending = false; checkStatus(); }, 2000);
-                });
+                .then(data => { checkStatus(); });
         }
 
         function send(code, value) {
-            isSending = true;
-            let statusDiv = document.getElementById('status');
-            statusDiv.innerText = "⏳ Отправка команды...";
-            statusDiv.style.background = "#ff9800";
-            
             fetch(`/api/command?code=${code}&value=${value}`)
                 .then(response => response.json())
-                .then(data => {
-                    if(data.status === "success") {
-                        statusDiv.innerText = "✅ " + data.message;
-                        statusDiv.style.background = "#4CAF50";
-                    } else {
-                        statusDiv.innerText = "❌ Ошибка Tuya";
-                        statusDiv.style.background = "#f44336";
-                    }
-                    setTimeout(() => { isSending = false; checkStatus(); }, 3000);
-                })
-                .catch(error => {
-                    statusDiv.innerText = "❌ Ошибка сети";
-                    statusDiv.style.background = "#f44336";
-                    setTimeout(() => { isSending = false; checkStatus(); }, 3000);
-                });
+                .then(data => { checkStatus(); });
         }
 
         window.onload = function() { checkStatus(); updateSlider(); };
-        setInterval(checkStatus, 12000);
+        setInterval(checkStatus, 5000); // Опрашиваем сервер каждые 5 секунд
     </script>
 </body>
 </html>
@@ -223,24 +249,36 @@ def index():
 
 @app.route('/api/status')
 def status():
-    try:
-        cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
-        res = cloud.cloudrequest(f"/v1.0/devices/{IR_HUB_ID}")
-        is_online = False
-        if res and res.get('success'):
-            is_online = res.get('result', {}).get('online', False)
-        
-        active_timers = []
-        now = time.time()
-        for t in timers:
-            rem = int((t['execute_at'] - now) / 60)
-            if rem >= 0:
-                action_ru = "ВКЛ" if t['action'] == 'on' else "ВЫКЛ"
-                active_timers.append(f"• {action_ru} через ~{rem} мин")
-                
-        return jsonify({"status": "success", "online": is_online, "timers": active_timers})
-    except:
-        return jsonify({"status": "error", "online": False, "timers": []})
+    # Считаем время оффлайна
+    offline_time_str = ""
+    if not device_status["online"] and device_status["offline_since"]:
+        diff = int(time.time() - device_status["offline_since"])
+        if diff < 60:
+            offline_time_str = f"{diff} сек"
+        else:
+            h = diff // 3600
+            m = (diff % 3600) // 60
+            offline_time_str = f"{h} ч {m} мин" if h > 0 else f"{m} мин"
+
+    # Считаем таймеры
+    active_timers = []
+    now = time.time()
+    for t in timers:
+        rem = int((t['execute_at'] - now) / 60)
+        if rem >= 0:
+            action_ru = "ВКЛ" if t['action'] == 'on' else "ВЫКЛ"
+            active_timers.append(f"• {action_ru} через ~{rem} мин")
+            
+    # Чтобы не пугать двойными командами (вкл+ветер), делим длину очереди на кол-во действий
+    q_len = len([c for c in command_queue if c.get('code') != 'wind' or not c.get('delay')])
+            
+    return jsonify({
+        "status": "success", 
+        "online": device_status["online"], 
+        "offline_time": offline_time_str,
+        "queue_len": q_len,
+        "timers": active_timers
+    })
 
 @app.route('/api/timer')
 def set_timer():
@@ -249,7 +287,6 @@ def set_timer():
     minutes = int(request.args.get('minutes', 0))
     
     timers = [t for t in timers if t['action'] != action]
-    
     execute_at = time.time() + (minutes * 60)
     timers.append({"action": action, "execute_at": execute_at})
     
@@ -257,28 +294,19 @@ def set_timer():
 
 @app.route('/api/command')
 def command():
+    global command_queue
     code = request.args.get('code')
     value = request.args.get('value', '')
     if value.isdigit(): value = int(value)
+    
+    # Складываем ВСЁ в очередь. Сервер сам разберется, когда отправить.
+    if code == 'power' and value == 1:
+        command_queue.append({"code": "power", "value": 1})
+        command_queue.append({"code": "wind", "value": 3, "delay": 1.5})
+    else:
+        command_queue.append({"code": code, "value": value})
         
-    try:
-        cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
-        
-        if code == 'power' and value == 1:
-            # 1. Включаем
-            cloud.cloudrequest(URL_IR, post={"code": "power", "value": 1})
-            # 2. Ждем полторы секунды
-            time.sleep(1.5)
-            # 3. Врубаем макс скорость
-            cloud.cloudrequest(URL_IR, post={"code": "wind", "value": 3})
-            return jsonify({"status": "success", "message": "Включен на макс. скорость!"})
-            
-        else:
-            cloud.cloudrequest(URL_IR, post={"code": code, "value": value})
-            return jsonify({"status": "success", "message": "Сигнал отправлен!"})
-            
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
+    return jsonify({"status": "queued"})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
