@@ -16,10 +16,10 @@ app = flask.Flask(__name__)
 
 URL_IR = f"/v1.0/infrareds/{IR_HUB_ID}/air-conditioners/{AC_DEVICE_ID}/command"
 
-# Глобальные переменные для умной логики
+# Глобальные списки теперь будут работать железно в одном процессе
 timers = []
-command_queue = [] # Очередь команд
-device_status = {"online": True, "offline_since": None} # Память о статусе
+command_queue = []
+device_status = {"online": True, "offline_since": None}
 
 def check_tuya_status():
     try:
@@ -31,7 +31,6 @@ def check_tuya_status():
         pass
     return False
 
-# ГЛАВНЫЙ ФОНОВЫЙ ПРОЦЕСС (работает 24/7)
 def master_worker():
     global timers, command_queue, device_status
     while True:
@@ -43,7 +42,7 @@ def master_worker():
             device_status["online"] = True
             device_status["offline_since"] = None
         else:
-            if device_status["online"]: # Только что отключился
+            if device_status["online"]:
                 device_status["offline_since"] = now
             device_status["online"] = False
 
@@ -51,42 +50,36 @@ def master_worker():
         for t in timers[:]:
             if now >= t['execute_at']:
                 if t['action'] == 'on':
-                    # Добавляем в очередь ВКЛ и ВЕТЕР
                     command_queue.append({"code": "power", "value": 1})
                     command_queue.append({"code": "wind", "value": 3, "delay": 1.5})
                 elif t['action'] == 'off':
                     command_queue.append({"code": "power", "value": 0})
                 timers.remove(t)
 
-        # 3. Разгребаем очередь команд (ТОЛЬКО ЕСЛИ ПУЛЬТ В СЕТИ)
+        # 3. Отправляем команды из очереди, если пульт в сети
         if device_status["online"] and len(command_queue) > 0:
             cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
             
             while len(command_queue) > 0:
-                cmd = command_queue[0] # Берем первую команду
-                
-                # Если нужна задержка перед выстрелом (например, для ветра)
+                cmd = command_queue[0]
                 if "delay" in cmd:
                     time.sleep(cmd["delay"])
                     
                 try:
                     res = cloud.cloudrequest(URL_IR, post={"code": cmd["code"], "value": cmd["value"]})
-                    # Если Tuya ругается на оффлайн
                     if res and not res.get('success') and 'offline' in str(res).lower():
                         device_status["online"] = False
                         if not device_status["offline_since"]: device_status["offline_since"] = now
-                        break # Прерываем отправку, оставляем в очереди
+                        break
                     
-                    # Успешно отправлено! Удаляем из очереди
                     command_queue.pop(0)
-                    time.sleep(0.5) # Микро-пауза между выстрелами
+                    time.sleep(0.5)
                 except Exception as e:
                     print("Ошибка отправки:", e)
-                    break # Останавливаемся до следующего цикла
+                    break
 
-        time.sleep(8) # Рабочий проверяет всё каждые 8 секунд
+        time.sleep(5) # Проверка каждые 5 секунд для мгновенного теста
 
-# Запускаем рабочего
 threading.Thread(target=master_worker, daemon=True).start()
 
 HTML_PAGE = """
@@ -108,7 +101,7 @@ HTML_PAGE = """
         .temp-display { font-size: 48px; margin: 0 20px; font-weight: bold; vertical-align: middle;}
         .section { margin: 15px auto; padding: 20px 10px; background: #2c2c2c; border-radius: 20px; width: 90%; max-width: 400px;}
         .section-title { font-size: 14px; color: #aaa; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 1px;}
-        #status { margin-top: 10px; font-size: 16px; color: #white; background: #444; padding: 12px; border-radius: 12px; display: inline-block; width: 85%; max-width: 380px; font-weight: bold; transition: 0.3s;}
+        #status { margin-top: 10px; font-size: 16px; color: white; background: #444; padding: 12px; border-radius: 12px; display: inline-block; width: 85%; max-width: 380px; font-weight: bold; transition: 0.3s;}
         
         input[type=range] { -webkit-appearance: none; width: 90%; margin: 15px 0; background: transparent; }
         input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; height: 24px; width: 24px; border-radius: 50%; background: #FF9800; cursor: pointer; margin-top: -8px; box-shadow: 0 0 10px rgba(255,152,0,0.5); }
@@ -128,9 +121,9 @@ HTML_PAGE = """
     </div>
     
     <div class="section" style="border: 2px dashed #444;">
-        <div class="section-title">Таймер</div>
-        <div class="timer-display" id="sliderValDisplay">30 мин</div>
-        <input type="range" id="timeSlider" min="10" max="720" step="10" value="30" oninput="updateSlider()">
+        <div class="section-title">Таймер тестовый</div>
+        <div class="timer-display" id="sliderValDisplay">1 мин</div>
+        <input type="range" id="timeSlider" min="1" max="180" step="1" value="1" oninput="updateSlider()">
         <div>
             <button class="btn power-on" style="width: 42%; font-size: 14px; background-color: #388E3C;" onclick="setTimer('on')">ВКЛ через...</button>
             <button class="btn power-off" style="width: 42%; font-size: 14px; background-color: #d32f2f;" onclick="setTimer('off')">ВЫКЛ через...</button>
@@ -194,8 +187,6 @@ HTML_PAGE = """
                 .then(response => response.json())
                 .then(data => {
                     let statusDiv = document.getElementById('status');
-                    
-                    // Формируем текст статуса
                     let text = "";
                     if(data.online) {
                         text = "🟢 Пульт активен";
@@ -205,15 +196,13 @@ HTML_PAGE = """
                         statusDiv.style.background = "#c62828";
                     }
                     
-                    // Если есть очередь команд
                     if(data.queue_len > 0) {
-                        text += ` ⏳ (Ждут: ${data.queue_len})`;
-                        if(data.online) statusDiv.style.background = "#ff9800"; // Оранжевый, если отправляет
+                        text += ` ⏳ (В очереди: ${data.queue_len})`;
+                        if(data.online) statusDiv.style.background = "#ff9800";
                     }
                     
                     statusDiv.innerText = text;
                     
-                    // Обновляем таймеры
                     let timersDiv = document.getElementById('activeTimers');
                     if(data.timers && data.timers.length > 0) {
                         timersDiv.innerHTML = "⏳ <b>Ожидают выполнения:</b><br>" + data.timers.join('<br>');
@@ -237,7 +226,7 @@ HTML_PAGE = """
         }
 
         window.onload = function() { checkStatus(); updateSlider(); };
-        setInterval(checkStatus, 5000); // Опрашиваем сервер каждые 5 секунд
+        setInterval(checkStatus, 4000); // Частый опрос для тестов
     </script>
 </body>
 </html>
@@ -249,7 +238,6 @@ def index():
 
 @app.route('/api/status')
 def status():
-    # Считаем время оффлайна
     offline_time_str = ""
     if not device_status["online"] and device_status["offline_since"]:
         diff = int(time.time() - device_status["offline_since"])
@@ -260,16 +248,18 @@ def status():
             m = (diff % 3600) // 60
             offline_time_str = f"{h} ч {m} мин" if h > 0 else f"{m} мин"
 
-    # Считаем таймеры
     active_timers = []
     now = time.time()
     for t in timers:
-        rem = int((t['execute_at'] - now) / 60)
-        if rem >= 0:
-            action_ru = "ВКЛ" if t['action'] == 'on' else "ВЫКЛ"
-            active_timers.append(f"• {action_ru} через ~{rem} мин")
+        # Для минутного теста показываем точный отсчет в секундах, если осталось меньше 2 минут
+        rem_sec = int(t['execute_at'] - now)
+        action_ru = "ВКЛ" if t['action'] == 'on' else "ВЫКЛ"
+        if rem_sec >= 0:
+            if rem_sec < 120:
+                active_timers.append(f"• {action_ru} через {rem_sec} сек")
+            else:
+                active_timers.append(f"• {action_ru} через ~{rem_sec // 60} мин")
             
-    # Чтобы не пугать двойными командами (вкл+ветер), делим длину очереди на кол-во действий
     q_len = len([c for c in command_queue if c.get('code') != 'wind' or not c.get('delay')])
             
     return jsonify({
@@ -299,7 +289,6 @@ def command():
     value = request.args.get('value', '')
     if value.isdigit(): value = int(value)
     
-    # Складываем ВСЁ в очередь. Сервер сам разберется, когда отправить.
     if code == 'power' and value == 1:
         command_queue.append({"code": "power", "value": 1})
         command_queue.append({"code": "wind", "value": 3, "delay": 1.5})
