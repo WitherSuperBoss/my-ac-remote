@@ -16,7 +16,6 @@ app = flask.Flask(__name__)
 
 URL_IR = f"/v1.0/infrareds/{IR_HUB_ID}/air-conditioners/{AC_DEVICE_ID}/command"
 
-# Глобальные списки теперь будут работать железно в одном процессе
 timers = []
 command_queue = []
 device_status = {"online": True, "offline_since": None}
@@ -36,7 +35,6 @@ def master_worker():
     while True:
         now = time.time()
         
-        # 1. Проверяем статус пульта
         is_online = check_tuya_status()
         if is_online:
             device_status["online"] = True
@@ -46,7 +44,6 @@ def master_worker():
                 device_status["offline_since"] = now
             device_status["online"] = False
 
-        # 2. Проверяем таймеры
         for t in timers[:]:
             if now >= t['execute_at']:
                 if t['action'] == 'on':
@@ -56,7 +53,6 @@ def master_worker():
                     command_queue.append({"code": "power", "value": 0})
                 timers.remove(t)
 
-        # 3. Отправляем команды из очереди, если пульт в сети
         if device_status["online"] and len(command_queue) > 0:
             cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
             
@@ -78,7 +74,7 @@ def master_worker():
                     print("Ошибка отправки:", e)
                     break
 
-        time.sleep(5) # Проверка каждые 5 секунд для мгновенного теста
+        time.sleep(5)
 
 threading.Thread(target=master_worker, daemon=True).start()
 
@@ -121,7 +117,7 @@ HTML_PAGE = """
     </div>
     
     <div class="section" style="border: 2px dashed #444;">
-        <div class="section-title">Таймер тестовый</div>
+        <div class="section-title">Таймер</div>
         <div class="timer-display" id="sliderValDisplay">1 мин</div>
         <input type="range" id="timeSlider" min="1" max="180" step="1" value="1" oninput="updateSlider()">
         <div>
@@ -155,6 +151,11 @@ HTML_PAGE = """
         <button class="btn wind-btn" onclick="send('wind', 1)">🔽 Минимум</button>
         <button class="btn wind-btn" onclick="send('wind', 2)">▶️ Средняя</button>
         <button class="btn wind-btn" onclick="send('wind', 3)">🔼 Максимум</button>
+    </div>
+    
+    <!-- Кнопка очистки очереди -->
+    <div style="margin-top: 10px; margin-bottom: 30px;">
+        <button class="btn" style="background-color: #555; color: white; width: 90%; max-width: 400px; font-size: 14px; border: 1px solid #777;" onclick="clearQueue()">🗑️ Очистить очередь команд</button>
     </div>
 
     <script>
@@ -224,9 +225,15 @@ HTML_PAGE = """
                 .then(response => response.json())
                 .then(data => { checkStatus(); });
         }
+        
+        function clearQueue() {
+            fetch('/api/clear_queue')
+                .then(res => res.json())
+                .then(data => { checkStatus(); });
+        }
 
         window.onload = function() { checkStatus(); updateSlider(); };
-        setInterval(checkStatus, 4000); // Частый опрос для тестов
+        setInterval(checkStatus, 4000); 
     </script>
 </body>
 </html>
@@ -251,7 +258,6 @@ def status():
     active_timers = []
     now = time.time()
     for t in timers:
-        # Для минутного теста показываем точный отсчет в секундах, если осталось меньше 2 минут
         rem_sec = int(t['execute_at'] - now)
         action_ru = "ВКЛ" if t['action'] == 'on' else "ВЫКЛ"
         if rem_sec >= 0:
@@ -296,6 +302,12 @@ def command():
         command_queue.append({"code": code, "value": value})
         
     return jsonify({"status": "queued"})
+
+@app.route('/api/clear_queue')
+def clear_queue():
+    global command_queue
+    command_queue.clear()
+    return jsonify({"status": "success"})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
