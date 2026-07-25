@@ -154,8 +154,13 @@ HTML_PAGE = """
     </div>
     
     <!-- Кнопка очистки очереди -->
-    <div style="margin-top: 10px; margin-bottom: 30px;">
+    <div style="margin-top: 10px;">
         <button class="btn" style="background-color: #555; color: white; width: 90%; max-width: 400px; font-size: 14px; border: 1px solid #777;" onclick="clearQueue()">🗑️ Очистить очередь команд</button>
+    </div>
+    
+    <!-- НОВАЯ КНОПКА ДИАГНОСТИКИ -->
+    <div style="margin-top: 5px; margin-bottom: 30px;">
+        <button class="btn" style="background-color: #2c3e50; color: white; width: 90%; max-width: 400px; font-size: 14px; border: 1px solid #777;" onclick="debugTuya()">🐛 Диагностика Tuya</button>
     </div>
 
     <script>
@@ -230,6 +235,15 @@ HTML_PAGE = """
             fetch('/api/clear_queue')
                 .then(res => res.json())
                 .then(data => { checkStatus(); });
+        }
+        
+        function debugTuya() {
+            fetch('/api/debug')
+                .then(res => res.json())
+                .then(data => {
+                    alert("Ответ от серверов Tuya:\\n\\n" + JSON.stringify(data, null, 2));
+                })
+                .catch(err => alert("Ошибка сети при диагностике"));
         }
 
         window.onload = function() { checkStatus(); updateSlider(); };
@@ -308,6 +322,15 @@ def clear_queue():
     global command_queue
     command_queue.clear()
     return jsonify({"status": "success"})
+
+@app.route('/api/debug')
+def debug_api():
+    try:
+        cloud = tinytuya.Cloud(apiRegion=API_REGION, apiKey=API_KEY, apiSecret=API_SECRET)
+        res = cloud.cloudrequest(f"/v1.0/devices/{IR_HUB_ID}")
+        return jsonify(res)
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
